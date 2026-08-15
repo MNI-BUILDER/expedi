@@ -1,10 +1,8 @@
--- ANIME EXPEDITIONS SUMMON MONITOR v5 — ProximityPrompt open + verified tab clicks
-print("🎴 AE Summon Monitor v5 booting...")
+-- ANIME EXPEDITIONS SUMMON MONITOR v6 (FINAL) — manual UI, teleport only, no clicking
+print("🎴 AE Summon Monitor v6 booting...")
 
 local HttpService = game:GetService("HttpService")
 local Players     = game:GetService("Players")
-local GuiService  = game:GetService("GuiService")
-local VIM         = game:GetService("VirtualInputManager")
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
@@ -15,19 +13,16 @@ local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/animeexpeditions"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local AUTO_OPEN   = true
-local AUTO_CYCLE  = true
-local AUTO_WALK   = false    -- true = teleport to the prompt if out of range (kick risk, only if needed)
-local PROMPT_WORDS = {"summon", "open menu"}
+local TELEPORT_TO_NPC   = true    -- walk to the summon NPC at boot + after respawn
+local TELEPORT_ON_SPAWN = true
+local PROMPT_WORDS      = {"summon", "open menu"}
+local EXPECTED_BANNERS  = 4
 
-local VERIFY_WINDOW = 2.2
-local TAB_DWELL     = 5
-local CHECK_INTERVAL= 1
-local POST_INTERVAL = 5
+local CHECK_INTERVAL     = 1
+local POST_INTERVAL      = 5
 local HEARTBEAT_INTERVAL = 30
-local STATUS_INTERVAL = 900
-local MANUAL_AFTER  = 2
-local DEBUG = true
+local STATUS_INTERVAL    = 900
+local STALE_AFTER        = 900    -- flag a cached banner older than this
 
 local httpreq = request or http_request or (syn and syn.request) or (fluxus and fluxus.request) or (http and http.request)
 
@@ -35,11 +30,8 @@ local Cache = {
     sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
     updateCounter = 0, lastPost = 0, lastHeartbeat = 0, lastStatus = 0,
     activeBanner = "Unknown", banners = {}, order = {},
-    prompt = nil, openMethod = nil, clickMethod = nil,
-    cycling = false, failedCycles = 0, manualMode = false, lastOpenTry = 0
+    fullSetAnnounced = false, wasOpen = false
 }
-
-local function dbg(s) if DEBUG then print("   " .. s) end end
 
 ----------------------------------------------------------------
 -- BASICS
@@ -107,36 +99,16 @@ local function panelShowing()
     return false
 end
 
-local function waitFor(verify, timeout)
-    local t0 = os.clock()
-    while os.clock() - t0 < (timeout or VERIFY_WINDOW) do
-        local ok, r = pcall(verify)
-        if ok and r then return true end
-        task.wait(0.15)
-    end
-    return false
-end
-
 ----------------------------------------------------------------
--- PROXIMITY PROMPT
+-- TELEPORT TO NPC (only automation left)
 ----------------------------------------------------------------
 local function promptMatches(p)
     local ot = string.lower(tostring(p.ObjectText or ""))
     local at = string.lower(tostring(p.ActionText or ""))
-    for _, wrd in ipairs(PROMPT_WORDS) do
-        if ot:find(wrd, 1, true) or at:find(wrd, 1, true) then return true end
+    for _, wd in ipairs(PROMPT_WORDS) do
+        if ot:find(wd, 1, true) or at:find(wd, 1, true) then return true end
     end
     return false
-end
-
-local function findPrompts()
-    local out = {}
-    pcall(function()
-        for _, d in ipairs(workspace:GetDescendants()) do
-            if d:IsA("ProximityPrompt") and promptMatches(d) then out[#out+1] = d end
-        end
-    end)
-    return out
 end
 
 local function promptPos(p)
@@ -151,158 +123,39 @@ local function promptPos(p)
     return nil
 end
 
-local function promptDistance(p)
-    local ch = LP.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local pos = promptPos(p)
-    if not hrp or not pos then return nil end
-    return (hrp.Position - pos).Magnitude
-end
-
-local function walkToPrompt(p)
-    if not AUTO_WALK then return false end
-    local ch = LP.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local pos = promptPos(p)
-    if not hrp or not pos then return false end
-    pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 4)) end)
-    task.wait(0.8)
-    return true
-end
-
-local function firePrompt(p)
-    if fireproximityprompt then
-        for _, call in ipairs({
-            function() fireproximityprompt(p) end,
-            function() fireproximityprompt(p, 1) end,
-            function() fireproximityprompt(p, 1, true) end
-        }) do
-            local ok = pcall(call)
-            if ok and waitFor(panelShowing, 1.5) then return "fireproximityprompt" end
-        end
-    end
-    local ok = pcall(function()
-        p:InputHoldBegin()
-        task.wait((p.HoldDuration or 0) + 0.1)
-        p:InputHoldEnd()
-    end)
-    if ok and waitFor(panelShowing, 1.5) then return "inputhold" end
-    ok = pcall(function()
-        local key = p.KeyboardKeyCode
-        if key == Enum.KeyCode.Unknown then key = Enum.KeyCode.E end
-        VIM:SendKeyEvent(true, key, false, game)
-        task.wait(math.max(0.12, (p.HoldDuration or 0) + 0.05))
-        VIM:SendKeyEvent(false, key, false, game)
-    end)
-    if ok and waitFor(panelShowing, 1.5) then return "keypress" end
-    return nil
-end
-
-----------------------------------------------------------------
--- GUI BUTTON FALLBACK
-----------------------------------------------------------------
-local function trySignals(btn, verify)
-    local gc = getconnections
-    if gc then
-        for _, sig in ipairs({"Activated","MouseButton1Click","MouseButton1Down"}) do
-            local fired = false
-            pcall(function()
-                for _, c in ipairs(gc(btn[sig])) do
-                    fired = true
-                    pcall(function() if c.Fire then c:Fire() else c.Function() end end)
-                end
-            end)
-            if fired and waitFor(verify) then return "gc:" .. sig end
-        end
-    end
-    if firesignal then
-        for _, sig in ipairs({"Activated","MouseButton1Click"}) do
-            local ok = pcall(function() firesignal(btn[sig]) end)
-            if ok and waitFor(verify) then return "fs:" .. sig end
-        end
-    end
-    local ok = pcall(function()
-        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
-        local sg = btn
-        while sg and not sg:IsA("ScreenGui") do sg = sg.Parent end
-        local yOff = (sg and sg.IgnoreGuiInset) and 0 or GuiService:GetGuiInset().Y
-        local x, y = pos.X + sz.X/2, pos.Y + sz.Y/2 + yOff
-        VIM:SendMouseMoveEvent(x, y, game)
-        task.wait(0.1)
-        VIM:SendMouseButtonEvent(x, y, 0, true,  game, 1)
-        task.wait(0.1)
-        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
-    end)
-    if ok and waitFor(verify) then return "virtual" end
-    return nil
-end
-
-local function guiOpenFallback()
-    local gui = getGui()
-    for _, sg in ipairs(PG:GetChildren()) do
-        if sg ~= gui and sg:IsA("ScreenGui") and sg.Enabled and sg.Name ~= "TeleportIcons" then
-            for _, d in ipairs(sg:GetDescendants()) do
-                local t = getText(d)
-                if t and t:lower():gsub("[%s'’]","") == "summon" and visible(d) then
-                    local btn = nearestButton(d, sg)
-                    if btn then
-                        local m = trySignals(btn, panelShowing)
-                        if m then return "gui:" .. m .. " @ " .. btn:GetFullName() end
-                    end
-                end
+local function findPrompt()
+    local best, bestPos
+    pcall(function()
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("ProximityPrompt") and promptMatches(d) then
+                local pos = promptPos(d)
+                if pos and not best then best, bestPos = d, pos end
             end
         end
-    end
-    return nil
+    end)
+    return best, bestPos
 end
 
-----------------------------------------------------------------
--- ENSURE OPEN
-----------------------------------------------------------------
-local function ensureOpen()
-    if panelShowing() then return true end
-    if not AUTO_OPEN then return false end
-    if os.clock() - Cache.lastOpenTry < 3 then return false end
-    Cache.lastOpenTry = os.clock()
-
-    local gui = getGui()
-    if gui and gui:IsA("ScreenGui") and not gui.Enabled then
-        pcall(function() gui.Enabled = true end)
-        if waitFor(panelShowing, 1) then Cache.openMethod = "Enabled=true" return true end
+local function teleportToNPC()
+    if not TELEPORT_TO_NPC then return false end
+    local ch = LP.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then print("⚠️ no character yet") return false end
+    local prompt, pos = findPrompt()
+    if not prompt or not pos then
+        print("⚠️ summon NPC prompt not found — walk over manually")
+        return false
     end
-
-    if not Cache.prompt or not Cache.prompt.Parent then
-        local list = findPrompts()
-        dbg("prompts found: " .. #list)
-        for _, p in ipairs(list) do
-            dbg("   " .. tostring(p.ObjectText) .. " / " .. tostring(p.ActionText)
-                .. " | dist=" .. tostring(promptDistance(p)) .. " | max=" .. tostring(p.MaxActivationDistance))
-        end
-        Cache.prompt = list[1]
+    local ok = pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 5)) end)
+    if ok then
+        print("🚶 teleported to summon NPC (" .. tostring(prompt.ObjectText) .. ")")
+        return true
     end
-
-    if Cache.prompt then
-        local d = promptDistance(Cache.prompt)
-        if d and d > (Cache.prompt.MaxActivationDistance or 10) and AUTO_WALK then
-            dbg("out of range (" .. math.floor(d) .. ") — moving in")
-            walkToPrompt(Cache.prompt)
-        end
-        local m = firePrompt(Cache.prompt)
-        if m then
-            Cache.openMethod = m
-            print("🔓 OPENED via prompt (" .. m .. ")")
-            return true
-        end
-        dbg("prompt fired but panel didn't open (dist=" .. tostring(d) .. ")")
-    end
-
-    local g = guiOpenFallback()
-    if g then Cache.openMethod = g print("🔓 OPENED via " .. g) return true end
     return false
 end
 
 ----------------------------------------------------------------
--- PANEL + SCAN
+-- SCAN
 ----------------------------------------------------------------
 local function resolvePanel()
     local gui = getGui()
@@ -330,11 +183,6 @@ local function resolvePanel()
     return nil, titleNode
 end
 
-local function currentTitle()
-    local _, node = resolvePanel()
-    return node and getText(node) or nil
-end
-
 local function scanAll()
     local gui = getGui()
     if not gui then return nil end
@@ -350,6 +198,7 @@ local function scanAll()
         if sib ~= titleNode and st and st ~= "" and not st:match("Banner$") then subtitle = st break end
     end
 
+    -- panel scope: units + timer
     for _, d in ipairs(scope:GetDescendants()) do
         local t = getText(d)
         if t and t ~= "" and visible(d) then
@@ -361,6 +210,7 @@ local function scanAll()
         end
     end
 
+    -- gui scope: costs, packs, pity
     local pity, costs, packs = {}, {}, {}
     for _, d in ipairs(gui:GetDescendants()) do
         local t = getText(d)
@@ -432,42 +282,6 @@ local function scanAll()
 end
 
 ----------------------------------------------------------------
--- TABS
-----------------------------------------------------------------
-local function findTabs()
-    local gui = getGui()
-    if not gui then return {} end
-    local tabs, seen = {}, {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        if getText(d) == "Banner" then
-            local btn = nearestButton(d, gui)
-            if btn and not seen[btn] then
-                local name
-                for _, sib in ipairs(d.Parent:GetChildren()) do
-                    local st = getText(sib)
-                    if sib ~= d and st and st ~= "" and st ~= "Banner" then name = st break end
-                end
-                if name then
-                    seen[btn] = true
-                    tabs[#tabs+1] = {btn = btn, name = name .. " Banner", x = btn.AbsolutePosition.X}
-                end
-            end
-        end
-    end
-    table.sort(tabs, function(a,b) return a.x < b.x end)
-    return tabs
-end
-
-local function clickTab(tab)
-    local before = currentTitle()
-    if before == tab.name then return "already" end
-    return trySignals(tab.btn, function()
-        local now = currentTitle()
-        return now ~= nil and now ~= before
-    end)
-end
-
-----------------------------------------------------------------
 -- NETWORK
 ----------------------------------------------------------------
 local function post(url, headers, body)
@@ -501,6 +315,7 @@ local function sendToAPI()
     for name, b in pairs(Cache.banners) do
         b.ageSeconds = now - (b.lastSeen or now)
         b.isActive = (name == Cache.activeBanner)
+        b.stale = b.ageSeconds > STALE_AFTER
     end
     local active = Cache.banners[Cache.activeBanner]
     local ok, code = post(API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. now, {
@@ -511,12 +326,13 @@ local function sendToAPI()
         sessionId = Cache.sessionId, game = "animeexpeditions",
         updateNumber = Cache.updateCounter, timestamp = now,
         playerName = LP.Name, userId = LP.UserId,
-        activeBanner = Cache.activeBanner, bannerOrder = Cache.order, bannerCount = n,
+        activeBanner = Cache.activeBanner, bannerOrder = Cache.order,
+        bannerCount = n, expectedBanners = EXPECTED_BANNERS,
         bannerChange = active and {text = active.timerText, seconds = active.timerSeconds} or nil,
         banners = Cache.banners,
         player = active and {pity = active.pity} or nil
     }))
-    print(ok and ("✅ POST #"..Cache.updateCounter.." -> "..code.." | banners: "..n)
+    print(ok and ("✅ POST #"..Cache.updateCounter.." -> "..code.." | banners: "..n.."/"..EXPECTED_BANNERS)
              or ("❌ POST failed: "..tostring(code)))
     Cache.lastPost = now
 end
@@ -538,23 +354,44 @@ local function unitString(b)
     return table.concat(t, "|")
 end
 
+local function missingList()
+    local have = {}
+    for n in pairs(Cache.banners) do have[n] = true end
+    local out = {}
+    for _, n in ipairs({"Beginner's Banner","Villain Banner","Standard Banner","Mini Banner"}) do
+        if not have[n] then out[#out+1] = n end
+    end
+    return out
+end
+
 local function record(data)
     if not data or not data.banner then return false end
     local prev = Cache.banners[data.banner]
     local changed = (unitString(prev) ~= unitString(data))
+
     if not prev then
         Cache.order[#Cache.order+1] = data.banner
         print("🆕 CACHED " .. data.banner .. " — " .. data.unitCount .. " units | "
-            .. tostring(data.currency) .. " | " .. tostring(data.cost.single)
-            .. "/" .. tostring(data.cost.ten) .. "  [" .. (bannerCount()+1) .. " total]")
+            .. tostring(data.currency) .. " | " .. tostring(data.cost.single) .. "/"
+            .. tostring(data.cost.ten) .. "   [" .. (bannerCount()) .. "/" .. EXPECTED_BANNERS .. "]")
+        local miss = missingList()
+        if #miss > 0 then print("   still need: " .. table.concat(miss, ", ")) end
     end
+
     Cache.banners[data.banner] = data
     Cache.activeBanner = data.banner
+
     if changed and prev then
         local lines = {}
         for _, u in ipairs(data.units) do lines[#lines+1] = "• **"..u.name.."** — "..u.rarity end
         discord("🔄 **BANNER ROTATED**", "**"..data.banner.."**\n"..(data.subtitle or "").."\n\n"
             ..table.concat(lines,"\n").."\n\n⏱ "..tostring(data.timerText), 16729344)
+    end
+
+    if not Cache.fullSetAnnounced and bannerCount() >= EXPECTED_BANNERS then
+        Cache.fullSetAnnounced = true
+        print("🎉 ALL " .. EXPECTED_BANNERS .. " BANNERS CACHED — payload is complete")
+        discord("🎉 **FULL SET CACHED**", "all " .. EXPECTED_BANNERS .. " banners in the payload", 5763719)
     end
     return changed
 end
@@ -562,110 +399,55 @@ end
 ----------------------------------------------------------------
 -- BOOT
 ----------------------------------------------------------------
-print("🔌 http=" .. tostring(httpreq ~= nil)
-    .. " | fireproximityprompt=" .. tostring(fireproximityprompt ~= nil)
-    .. " | getconnections=" .. tostring(getconnections ~= nil))
-discord("🎴 **AE MONITOR v5 ONLINE**", "session `"..Cache.sessionId.."`", 5763719)
+print("🔌 http=" .. tostring(httpreq ~= nil))
+discord("🎴 **AE MONITOR v6 ONLINE**", "session `"..Cache.sessionId.."`", 5763719)
 
 pcall(function()
     local VU = game:GetService("VirtualUser")
     LP.Idled:Connect(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end)
 end)
 
-LP.CharacterAdded:Connect(function()
-    task.wait(6)
-    Cache.prompt = nil
-    print("♻️ respawned — reopening")
-    ensureOpen()
-end)
-
-if not ensureOpen() then
-    print("⚠️ couldn't open it — walk to the NPC and press E, I'll take over from there")
-end
-repeat task.wait(1) until panelShowing()
-print("✅ panel open (" .. tostring(Cache.openMethod or "manual") .. ")")
-
-local tabs = findTabs()
-print("🗂 tabs: " .. #tabs)
-if getconnections then
-    for _, t in ipairs(tabs) do
-        local a, c = 0, 0
-        pcall(function() a = #getconnections(t.btn.Activated) end)
-        pcall(function() c = #getconnections(t.btn.MouseButton1Click) end)
-        print("   " .. t.name .. "  Activated=" .. a .. " MB1Click=" .. c)
-    end
-end
-
-----------------------------------------------------------------
--- CYCLE
-----------------------------------------------------------------
-if AUTO_CYCLE then
-    task.spawn(function()
-        while true do
-            if not panelShowing() then
-                ensureOpen() task.wait(2)
-            else
-                tabs = findTabs()
-                local wins = 0
-                for _, tab in ipairs(tabs) do
-                    if panelShowing() then
-                        Cache.cycling = true
-                        local m = clickTab(tab)
-                        if m then
-                            wins = wins + 1
-                            if not Cache.clickMethod and m ~= "already" then
-                                Cache.clickMethod = m
-                                print("🖱 tab clicks working via: " .. m)
-                            end
-                            task.wait(0.6)
-                            local ok, data = pcall(scanAll)
-                            if ok and data then record(data) sendToAPI() end
-                        end
-                        Cache.cycling = false
-                    end
-                    task.wait(TAB_DWELL)
-                end
-                if wins == 0 and not Cache.manualMode then
-                    Cache.failedCycles = Cache.failedCycles + 1
-                    if Cache.failedCycles >= MANUAL_AFTER then
-                        Cache.manualMode = true
-                        AUTO_CYCLE = false
-                        print("🖐 MANUAL MODE — click each banner tab once, I'll cache all of them")
-                    end
-                else
-                    Cache.failedCycles = 0
-                end
-            end
-        end
+if TELEPORT_ON_SPAWN then
+    LP.CharacterAdded:Connect(function()
+        task.wait(6)
+        print("♻️ respawned")
+        teleportToNPC()
     end)
 end
+
+teleportToNPC()
+print("👉 press E at the NPC, then click each banner tab once — every one you open gets cached")
 
 ----------------------------------------------------------------
 -- MAIN
 ----------------------------------------------------------------
 task.spawn(function()
     while true do
-        if not panelShowing() then
-            ensureOpen()
-        elseif not Cache.cycling then
+        local open = panelShowing()
+        if open then
+            if not Cache.wasOpen then print("📂 summon menu open") Cache.wasOpen = true end
             local ok, data = pcall(scanAll)
             if ok and data then
                 if record(data) then sendToAPI() end
                 print("🎴 "..data.banner.." | "..data.unitCount.." units | "..tostring(data.timerText)
                     .." | "..tostring(data.currency).." | "..tostring(data.cost.single)
-                    .."/"..tostring(data.cost.ten).." | cached: "..bannerCount())
+                    .."/"..tostring(data.cost.ten).." | cached "..bannerCount().."/"..EXPECTED_BANNERS)
             end
+        elseif Cache.wasOpen then
+            Cache.wasOpen = false
+            print("📁 menu closed — serving " .. bannerCount() .. " cached banners")
         end
+
         local now = os.time()
         if (now - Cache.lastPost) >= POST_INTERVAL then sendToAPI() end
         if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then heartbeat() Cache.lastHeartbeat = now end
         if (now - Cache.lastStatus) >= STATUS_INTERVAL then
             discord("📊 **AE STATUS**", "updates: "..Cache.updateCounter.."\nbanners: "..bannerCount()
-                .."\nactive: "..Cache.activeBanner)
+                .."/"..EXPECTED_BANNERS.."\nactive: "..Cache.activeBanner)
             Cache.lastStatus = now
         end
         task.wait(CHECK_INTERVAL)
     end
 end)
 
-print("🚀 v5 RUNNING | session " .. Cache.sessionId)
+print("🚀 v6 RUNNING | session " .. Cache.sessionId)
