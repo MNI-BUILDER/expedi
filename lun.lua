@@ -1,5 +1,5 @@
--- ANIME EXPEDITIONS SUMMON MONITOR v7 (FINAL) — manual open, auto tab cycling, no teleport
-print("🎴 AE Summon Monitor v7 booting...")
+-- ANIME EXPEDITIONS GOLD SHOP MONITOR v1 — auto-discover, scroll-aware, tab cycling
+print("🪙 AE Gold Shop Monitor booting...")
 
 local HttpService = game:GetService("HttpService")
 local Players     = game:GetService("Players")
@@ -11,20 +11,21 @@ local PG = LP:WaitForChild("PlayerGui")
 ----------------------------------------------------------------
 -- CONFIG
 ----------------------------------------------------------------
-local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/animeexpeditions"
+local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/animeexpeditions/goldshop"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local TAB_CYCLE      = true    -- auto-switch banner tabs
-local TAB_DWELL      = 5       -- seconds parked on each tab
-local VERIFY_WINDOW  = 2.2     -- how long to wait for a tab click to register
-local EXPECTED_BANNERS = 4
+local TAB_CYCLE   = true     -- auto-switch Gold Shop <-> Cosmetic Shop
+local AUTO_SCROLL = true     -- walk the canvas to catch items below the fold
+local TAB_DWELL   = 6
+local VERIFY_WINDOW = 2.2
+local EXPECTED_SHOPS = 2
 
-local CHECK_INTERVAL     = 1
-local POST_INTERVAL      = 5
+local CHECK_INTERVAL     = 2
+local POST_INTERVAL      = 10
 local HEARTBEAT_INTERVAL = 30
 local STATUS_INTERVAL    = 900
-local STALE_AFTER        = 900
+local STALE_AFTER        = 1800
 local DEBUG = true
 
 local httpreq = request or http_request or (syn and syn.request) or (fluxus and fluxus.request) or (http and http.request)
@@ -32,9 +33,9 @@ local httpreq = request or http_request or (syn and syn.request) or (fluxus and 
 local Cache = {
     sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
     updateCounter = 0, lastPost = 0, lastHeartbeat = 0, lastStatus = 0,
-    activeBanner = "Unknown", banners = {}, order = {},
-    cycling = false, clickMethod = nil, failedCycles = 0,
-    manualMode = false, fullSetAnnounced = false, wasOpen = false
+    activeShop = "Unknown", shops = {}, order = {},
+    gui = nil, cycling = false, clickMethod = nil,
+    failedCycles = 0, manualMode = false, wasOpen = false
 }
 
 local function dbg(s) if DEBUG then print("   " .. s) end end
@@ -69,10 +70,14 @@ local function num(s) if not s then return nil end return tonumber((s:gsub("[,%s
 
 local function parseTime(t)
     if not t then return nil end
-    local h = tonumber(t:match("(%d+)%s*h")) or 0
-    local m = tonumber(t:match("(%d+)%s*m")) or 0
-    local s = tonumber(t:match("(%d+)%s*s")) or 0
-    if (h+m+s) > 0 then return h*3600 + m*60 + s end
+    local l = t:lower()
+        :gsub("hours?", "h"):gsub("hrs?", "h")
+        :gsub("minutes?", "m"):gsub("mins?", "m")
+        :gsub("seconds?", "s"):gsub("secs?", "s")
+    local h = tonumber(l:match("(%d+)%s*h")) or 0
+    local m = tonumber(l:match("(%d+)%s*m")) or 0
+    local s = tonumber(l:match("(%d+)%s*s")) or 0
+    if (h + m + s) > 0 then return h*3600 + m*60 + s end
     local a,b,c = t:match("(%d+):(%d+):(%d+)")
     if a then return tonumber(a)*3600 + tonumber(b)*60 + tonumber(c) end
     local d,e = t:match("^(%d+):(%d+)$")
@@ -81,7 +86,12 @@ local function parseTime(t)
 end
 
 local function isTimeText(t)
-    return t:match("%d+%s*m,%s*%d+%s*s") or t:match("%d+%s*h,%s*%d+%s*m") or t:match("%d+:%d+")
+    local l = t:lower()
+    if l:match("%d+%s*:%s*%d+") then return true end
+    if l:match("%d+%s*hour") or l:match("%d+%s*minute") or l:match("%d+%s*second") then return true end
+    if l:match("%d+%s*h[%s,]") or l:match("%d+%s*m[%s,]") then return true end
+    if l:match("^%d+%s*[hms]$") then return true end
+    return false
 end
 
 local function nearestButton(node, stopAt)
@@ -91,18 +101,6 @@ local function nearestButton(node, stopAt)
         cur = cur.Parent
     end
     return nil
-end
-
-local function getGui() return PG:FindFirstChild("Summon") end
-
-local function panelShowing()
-    local gui = getGui()
-    if not gui or (gui:IsA("ScreenGui") and not gui.Enabled) then return false end
-    for _, d in ipairs(gui:GetDescendants()) do
-        local t = getText(d)
-        if t and t ~= "Banner" and t:match("^.+%s+Banner$") and visible(d) then return true end
-    end
-    return false
 end
 
 local function waitFor(verify, timeout)
@@ -116,8 +114,257 @@ local function waitFor(verify, timeout)
 end
 
 ----------------------------------------------------------------
--- CLICK ENGINE (tabs only)
+-- FIND THE SHOP GUI (no hardcoded name)
 ----------------------------------------------------------------
+local function findShopGui()
+    for _, sg in ipairs(PG:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Enabled then
+            for _, d in ipairs(sg:GetDescendants()) do
+                local t = getText(d)
+                if t and visible(d) then
+                    if t:lower():find("shop restock", 1, true) then return sg end
+                    if t:match("^%d+%s*[Ll]eft") then return sg end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function shopShowing()
+    local gui = Cache.gui
+    if not gui or not gui.Parent or (gui:IsA("ScreenGui") and not gui.Enabled) then
+        Cache.gui = findShopGui()
+        gui = Cache.gui
+    end
+    if not gui then return false end
+    for _, d in ipairs(gui:GetDescendants()) do
+        local t = getText(d)
+        if t and visible(d) and (t:lower():find("shop restock", 1, true) or t:match("^%d+%s*[Ll]eft")) then
+            return true
+        end
+    end
+    return false
+end
+
+local function shopHeader()
+    local gui = Cache.gui
+    if not gui then return nil end
+    local best, bestSize
+    for _, d in ipairs(gui:GetDescendants()) do
+        local t = getText(d)
+        if t and t:match("^.+%s+[Ss]hop$") and visible(d) and not nearestButton(d, gui) then
+            local sz = 0
+            pcall(function() sz = d.TextSize end)
+            if not bestSize or sz > bestSize then best, bestSize = t, sz end
+        end
+    end
+    return best
+end
+
+----------------------------------------------------------------
+-- CARD PARSING
+----------------------------------------------------------------
+local function cardRootFrom(node, gui)
+    local cur = node
+    for _ = 1, 6 do
+        cur = cur.Parent
+        if not cur or cur == gui or cur:IsA("ScreenGui") then break end
+        local texts = 0
+        for _, d in ipairs(cur:GetDescendants()) do
+            local t = getText(d)
+            if t and t ~= "" and visible(d) then texts = texts + 1 end
+        end
+        if texts >= 4 then return cur end
+    end
+    return nil
+end
+
+local function readCard(card)
+    local stock, price, buyNode, soldOut = nil, nil, nil, false
+    local words, numbers = {}, {}
+    local icon, iconArea = nil, 0
+
+    for _, d in ipairs(card:GetDescendants()) do
+        local t = getText(d)
+        if t and t ~= "" and visible(d) then
+            local n = t:match("^(%d+)%s*[Ll]eft")
+            if n then
+                stock = tonumber(n)
+            elseif t:lower() == "buy" then
+                buyNode = d
+            elseif t:lower():find("out of stock", 1, true) or t:lower():find("sold out", 1, true) then
+                soldOut = true
+            elseif t:match("^[%d,]+$") then
+                numbers[#numbers+1] = {text = t, node = d}
+            else
+                local sz = 0
+                pcall(function() sz = d.TextSize end)
+                words[#words+1] = {text = t, size = sz, len = #t}
+            end
+        end
+        if (d:IsA("ImageLabel") or d:IsA("ImageButton")) and visible(d) then
+            local ok, img = pcall(function() return d.Image end)
+            if ok and img and img ~= "" then
+                local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+                if area > iconArea then icon, iconArea = img, area end
+            end
+        end
+    end
+
+    if buyNode then
+        local btn = nearestButton(buyNode, card) or buyNode.Parent
+        for _, d in ipairs(btn:GetDescendants()) do
+            local t = getText(d)
+            if t and t:match("^[%d,]+$") and visible(d) then price = num(t) break end
+        end
+    end
+    if not price and numbers[1] then price = num(numbers[1].text) end
+
+    local name, desc
+    table.sort(words, function(a,b)
+        if a.size ~= b.size then return a.size > b.size end
+        return a.len < b.len
+    end)
+    for _, w in ipairs(words) do
+        if not name then name = w.text
+        elseif not desc or #w.text > #desc then desc = w.text end
+    end
+    if name and desc and #name > #desc then name, desc = desc, name end
+
+    if soldOut then stock = 0 end
+    if not name then return nil end
+
+    return {
+        name = name, stock = stock, price = price,
+        description = desc, icon = icon, soldOut = soldOut,
+        y = card.AbsolutePosition.Y, x = card.AbsolutePosition.X
+    }
+end
+
+local function collectCards(gui, into)
+    local roots = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        local t = getText(d)
+        if t and visible(d) and (t:match("^%d+%s*[Ll]eft") or t:lower() == "buy") then
+            local card = cardRootFrom(d, gui)
+            if card then roots[card] = true end
+        end
+    end
+    for card in pairs(roots) do
+        local ok, item = pcall(readCard, card)
+        if ok and item and item.name then
+            local prev = into[item.name]
+            if not prev or (item.stock ~= nil and prev.stock == nil) then into[item.name] = item end
+        end
+    end
+end
+
+local function findScrollFrame(gui)
+    local best, bestArea
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("ScrollingFrame") and visible(d) then
+            local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+            if not bestArea or area > bestArea then best, bestArea = d, area end
+        end
+    end
+    return best
+end
+
+local function scanShop()
+    local gui = Cache.gui
+    if not gui then return nil end
+    local header = shopHeader()
+    if not header then return nil end
+
+    local items = {}
+    collectCards(gui, items)
+
+    local scrolled = false
+    if AUTO_SCROLL then
+        local sf = findScrollFrame(gui)
+        if sf then
+            local ok = pcall(function()
+                local start = sf.CanvasPosition
+                local canvasY = sf.AbsoluteCanvasSize.Y
+                local viewY = sf.AbsoluteWindowSize.Y
+                if canvasY > viewY + 5 then
+                    scrolled = true
+                    local step = math.max(viewY * 0.8, 50)
+                    local y = 0
+                    while y <= (canvasY - viewY) + step do
+                        sf.CanvasPosition = Vector2.new(sf.CanvasPosition.X, y)
+                        task.wait(0.12)
+                        collectCards(gui, items)
+                        y = y + step
+                    end
+                    sf.CanvasPosition = start
+                end
+            end)
+            if not ok then dbg("scroll walk failed") end
+        end
+    end
+
+    local list = {}
+    for _, it in pairs(items) do list[#list+1] = it end
+    table.sort(list, function(a, b)
+        if math.abs(a.y - b.y) > 5 then return a.y < b.y end
+        return a.x < b.x
+    end)
+    for i, it in ipairs(list) do
+        it.index = i
+        it.x, it.y = nil, nil
+    end
+
+    local restockText
+    for _, d in ipairs(gui:GetDescendants()) do
+        local t = getText(d)
+        if t and visible(d) and t:lower():find("shop restock", 1, true) then
+            for _, sib in ipairs(d.Parent:GetChildren()) do
+                local st = getText(sib)
+                if sib ~= d and st and isTimeText(st) then restockText = st break end
+            end
+            if not restockText and d.Parent.Parent then
+                for _, sib in ipairs(d.Parent.Parent:GetDescendants()) do
+                    local st = getText(sib)
+                    if st and isTimeText(st) and visible(sib) then restockText = st break end
+                end
+            end
+            break
+        end
+    end
+
+    local totalStock = 0
+    for _, it in ipairs(list) do totalStock = totalStock + (it.stock or 0) end
+
+    return {
+        shop = header, items = list, itemCount = #list, totalStock = totalStock,
+        restockText = restockText, restockSeconds = parseTime(restockText),
+        scrolled = scrolled, lastSeen = os.time()
+    }
+end
+
+----------------------------------------------------------------
+-- TABS
+----------------------------------------------------------------
+local function findTabs()
+    local gui = Cache.gui
+    if not gui then return {} end
+    local tabs, seen = {}, {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        local t = getText(d)
+        if t and t:match("^.+%s+[Ss]hop$") and visible(d) then
+            local btn = nearestButton(d, gui)
+            if btn and not seen[btn] then
+                seen[btn] = true
+                tabs[#tabs+1] = {btn = btn, name = t, y = btn.AbsolutePosition.Y}
+            end
+        end
+    end
+    table.sort(tabs, function(a,b) return a.y < b.y end)
+    return tabs
+end
+
 local function trySignals(btn, verify)
     local gc = getconnections
     if gc then
@@ -154,170 +401,11 @@ local function trySignals(btn, verify)
     return nil
 end
 
-----------------------------------------------------------------
--- SCAN
-----------------------------------------------------------------
-local function resolvePanel()
-    local gui = getGui()
-    if not gui then return nil end
-    local titleNode
-    for _, d in ipairs(gui:GetDescendants()) do
-        local t = getText(d)
-        if t and t ~= "Banner" and t:match("^.+%s+Banner$") and visible(d) then
-            if not nearestButton(d, gui) then titleNode = d break end
-        end
-    end
-    if not titleNode then return nil end
-    local cur = titleNode
-    for _ = 1, 8 do
-        cur = cur.Parent
-        if not cur or cur:IsA("ScreenGui") then break end
-        local rar, vp = 0, 0
-        for _, d in ipairs(cur:GetDescendants()) do
-            local t = getText(d)
-            if t and t:match("^%a+%s+Unit$") then rar = rar + 1 end
-            if d:IsA("ViewportFrame") then vp = vp + 1 end
-        end
-        if rar >= 1 and vp >= 1 then return cur, titleNode end
-    end
-    return nil, titleNode
-end
-
-local function currentTitle()
-    local _, node = resolvePanel()
-    return node and getText(node) or nil
-end
-
-local function scanAll()
-    local gui = getGui()
-    if not gui then return nil end
-    local panel, titleNode = resolvePanel()
-    if not titleNode then return nil end
-    local scope = panel or titleNode.Parent
-
-    local title, subtitle, timerText, changeNode = getText(titleNode), nil, nil, nil
-    local rarities, featured = {}, 0
-
-    for _, sib in ipairs(titleNode.Parent:GetChildren()) do
-        local st = getText(sib)
-        if sib ~= titleNode and st and st ~= "" and not st:match("Banner$") then subtitle = st break end
-    end
-
-    -- panel scope: units + timer
-    for _, d in ipairs(scope:GetDescendants()) do
-        local t = getText(d)
-        if t and t ~= "" and visible(d) then
-            if t == "Banner Change" then changeNode = d end
-            if isTimeText(t) and not timerText then timerText = t end
-            local rar = t:match("^(%a+)%s+Unit$")
-            if rar then rarities[#rarities+1] = {node = d, rarity = rar, x = d.AbsolutePosition.X} end
-            if t == "[Featured]" then featured = featured + 1 end
-        end
-    end
-
-    -- gui scope: costs, packs, pity (these live outside the panel)
-    local pity, costs, packs = {}, {}, {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        local t = getText(d)
-        if t and t ~= "" and visible(d) then
-            local pn = t:match("^(%a+)%s+Pity$")
-            if pn then
-                for _, sib in ipairs(d.Parent:GetChildren()) do
-                    local st = getText(sib)
-                    if sib ~= d and st and st:match("^[%d,]+/[%d,]+$") then pity[pn] = st break end
-                end
-            end
-            if t == "Summon" or t == "Summon 10x" then
-                local btn = nearestButton(d, gui)
-                if btn then
-                    local best, raw = nil, {}
-                    for _, sub in ipairs(btn:GetDescendants()) do
-                        local stt = getText(sub)
-                        if stt and stt:match("^[%d,]+$") and visible(sub) then
-                            raw[#raw+1] = stt
-                            local v = num(stt)
-                            if v and (not best or v > best) then best = v end
-                        end
-                    end
-                    local key = (t == "Summon") and "single" or "ten"
-                    costs[key] = best
-                    costs[key .. "Raw"] = table.concat(raw, "/")
-                end
-            end
-            local amt, cn = t:match("^([%d,]+)%s+(%a[%w%s']*)$")
-            if amt and cn and #cn <= 24 then packs[#packs+1] = {amount = num(amt), currency = cn} end
-        end
-    end
-
-    if changeNode then
-        for _, sib in ipairs(changeNode.Parent:GetChildren()) do
-            local st = getText(sib)
-            if sib ~= changeNode and st and isTimeText(st) then timerText = st break end
-        end
-    end
-
-    table.sort(rarities, function(a,b) return a.x < b.x end)
-    local units, seen = {}, {}
-    for _, r in ipairs(rarities) do
-        for _, sib in ipairs(r.node.Parent:GetChildren()) do
-            local st = getText(sib)
-            if sib ~= r.node and st and st ~= "" and not st:match("%s+Unit$")
-               and not st:match("^%[") and visible(sib) then
-                if not seen[st] then
-                    seen[st] = true
-                    units[#units+1] = {name = st, rarity = r.rarity}
-                end
-                break
-            end
-        end
-    end
-
-    local counts, currency, best = {}, nil, 0
-    for _, p in ipairs(packs) do
-        counts[p.currency] = (counts[p.currency] or 0) + 1
-        if counts[p.currency] > best then best = counts[p.currency] currency = p.currency end
-    end
-
-    return {
-        banner = title, subtitle = subtitle, units = units, unitCount = #units,
-        timerText = timerText, timerSeconds = parseTime(timerText),
-        cost = costs, currency = currency, featuredTags = featured,
-        pity = pity, lastSeen = os.time()
-    }
-end
-
-----------------------------------------------------------------
--- TABS
-----------------------------------------------------------------
-local function findTabs()
-    local gui = getGui()
-    if not gui then return {} end
-    local tabs, seen = {}, {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        if getText(d) == "Banner" then
-            local btn = nearestButton(d, gui)
-            if btn and not seen[btn] then
-                local name
-                for _, sib in ipairs(d.Parent:GetChildren()) do
-                    local st = getText(sib)
-                    if sib ~= d and st and st ~= "" and st ~= "Banner" then name = st break end
-                end
-                if name then
-                    seen[btn] = true
-                    tabs[#tabs+1] = {btn = btn, name = name .. " Banner", x = btn.AbsolutePosition.X}
-                end
-            end
-        end
-    end
-    table.sort(tabs, function(a,b) return a.x < b.x end)
-    return tabs
-end
-
 local function clickTab(tab)
-    local before = currentTitle()
+    local before = shopHeader()
     if before == tab.name then return "already" end
     return trySignals(tab.btn, function()
-        local now = currentTitle()
+        local now = shopHeader()
         return now ~= nil and now ~= before
     end)
 end
@@ -337,43 +425,42 @@ end
 local function discord(title, desc, color)
     local ok, code = post(DISCORD_WEBHOOK,
         {["Content-Type"]="application/json", ["User-Agent"]="Mozilla/5.0"},
-        HttpService:JSONEncode({content = title, embeds = {{description = desc, color = color or 5814783,
-            footer = {text = "AE | " .. Cache.sessionId}, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}}}))
+        HttpService:JSONEncode({content = title, embeds = {{description = desc:sub(1,3800), color = color or 16763904,
+            footer = {text = "AE GoldShop | " .. Cache.sessionId}, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}}}))
     if not ok then print("⚠️ discord failed: " .. tostring(code)) end
 end
 
-local function bannerCount()
+local function shopCount()
     local n = 0
-    for _ in pairs(Cache.banners) do n = n + 1 end
+    for _ in pairs(Cache.shops) do n = n + 1 end
     return n
 end
 
 local function sendToAPI()
-    local n = bannerCount()
+    local n = shopCount()
     if n == 0 then return end
     Cache.updateCounter = Cache.updateCounter + 1
     local now = os.time()
-    for name, b in pairs(Cache.banners) do
-        b.ageSeconds = now - (b.lastSeen or now)
-        b.isActive = (name == Cache.activeBanner)
-        b.stale = b.ageSeconds > STALE_AFTER
+    for name, s in pairs(Cache.shops) do
+        s.ageSeconds = now - (s.lastSeen or now)
+        s.isActive = (name == Cache.activeShop)
+        s.stale = s.ageSeconds > STALE_AFTER
     end
-    local active = Cache.banners[Cache.activeBanner]
+    local active = Cache.shops[Cache.activeShop]
     local ok, code = post(API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. now, {
         ["Content-Type"]="application/json", ["Authorization"]=API_KEY,
         ["Cache-Control"]="no-cache, no-store, must-revalidate",
         ["X-Session-ID"]=Cache.sessionId, ["X-Update-Number"]=tostring(Cache.updateCounter)
     }, HttpService:JSONEncode({
-        sessionId = Cache.sessionId, game = "animeexpeditions",
+        sessionId = Cache.sessionId, game = "animeexpeditions", shopType = "goldshop",
         updateNumber = Cache.updateCounter, timestamp = now,
         playerName = LP.Name, userId = LP.UserId,
-        activeBanner = Cache.activeBanner, bannerOrder = Cache.order,
-        bannerCount = n, expectedBanners = EXPECTED_BANNERS,
-        bannerChange = active and {text = active.timerText, seconds = active.timerSeconds} or nil,
-        banners = Cache.banners,
-        player = active and {pity = active.pity} or nil
+        activeShop = Cache.activeShop, shopOrder = Cache.order,
+        shopCount = n, expectedShops = EXPECTED_SHOPS,
+        restock = active and {text = active.restockText, seconds = active.restockSeconds} or nil,
+        shops = Cache.shops
     }))
-    print(ok and ("✅ POST #"..Cache.updateCounter.." -> "..code.." | banners: "..n.."/"..EXPECTED_BANNERS)
+    print(ok and ("✅ POST #"..Cache.updateCounter.." -> "..code.." | shops: "..n)
              or ("❌ POST failed: "..tostring(code)))
     Cache.lastPost = now
 end
@@ -381,61 +468,61 @@ end
 local function heartbeat()
     post(API_ENDPOINT .. "/heartbeat",
         {["Content-Type"]="application/json", ["Authorization"]=API_KEY, ["X-Session-ID"]=Cache.sessionId},
-        HttpService:JSONEncode({sessionId=Cache.sessionId, status="ALIVE", game="animeexpeditions", timestamp=os.time()}))
+        HttpService:JSONEncode({sessionId=Cache.sessionId, status="ALIVE",
+            game="animeexpeditions", shopType="goldshop", timestamp=os.time()}))
 end
 
 ----------------------------------------------------------------
 -- RECORD
 ----------------------------------------------------------------
-local function unitString(b)
-    if not b or not b.units then return "" end
+local function sig(s)
+    if not s or not s.items then return "" end
     local t = {}
-    for _, u in ipairs(b.units) do t[#t+1] = u.name .. ":" .. u.rarity end
+    for _, it in ipairs(s.items) do
+        t[#t+1] = it.name .. ":" .. tostring(it.stock) .. ":" .. tostring(it.price)
+    end
     table.sort(t)
     return table.concat(t, "|")
 end
 
-local function missingList()
-    local have = {}
-    for n in pairs(Cache.banners) do have[n] = true end
-    local out = {}
-    for _, n in ipairs({"Beginner's Banner","Villain Banner","Standard Banner","Mini Banner"}) do
-        if not have[n] then out[#out+1] = n end
-    end
-    return out
-end
-
 local function record(data)
-    if not data or not data.banner then return false end
-    local prev = Cache.banners[data.banner]
-    local changed = (unitString(prev) ~= unitString(data))
+    if not data or not data.shop or data.itemCount == 0 then return false end
+    local prev = Cache.shops[data.shop]
+    local changed = (sig(prev) ~= sig(data))
 
     if not prev then
-        Cache.order[#Cache.order+1] = data.banner
-        Cache.banners[data.banner] = data
-        print("🆕 CACHED " .. data.banner .. " — " .. data.unitCount .. " units | "
-            .. tostring(data.currency) .. " | " .. tostring(data.cost.single) .. "/"
-            .. tostring(data.cost.ten) .. "   [" .. bannerCount() .. "/" .. EXPECTED_BANNERS .. "]")
-        local miss = missingList()
-        if #miss > 0 then print("   still need: " .. table.concat(miss, ", ")) end
-    else
-        Cache.banners[data.banner] = data
-    end
-
-    Cache.activeBanner = data.banner
-
-    if changed and prev then
+        Cache.order[#Cache.order+1] = data.shop
+        Cache.shops[data.shop] = data
+        print("🆕 CACHED " .. data.shop .. " — " .. data.itemCount .. " items | restock "
+            .. tostring(data.restockText) .. "  [" .. shopCount() .. "/" .. EXPECTED_SHOPS .. "]")
+        for _, it in ipairs(data.items) do
+            print("      " .. it.name .. "  stock=" .. tostring(it.stock) .. "  price=" .. tostring(it.price))
+        end
         local lines = {}
-        for _, u in ipairs(data.units) do lines[#lines+1] = "• **"..u.name.."** — "..u.rarity end
-        discord("🔄 **BANNER ROTATED**", "**"..data.banner.."**\n"..(data.subtitle or "").."\n\n"
-            ..table.concat(lines,"\n").."\n\n⏱ "..tostring(data.timerText), 16729344)
+        for _, it in ipairs(data.items) do
+            lines[#lines+1] = "• **" .. it.name .. "** — " .. tostring(it.stock) .. " left · " .. tostring(it.price) .. "g"
+        end
+        discord("🪙 **" .. data.shop .. "**", table.concat(lines, "\n")
+            .. "\n\n⏱ restock: " .. tostring(data.restockText))
+    else
+        Cache.shops[data.shop] = data
+        if changed then
+            local lines = {}
+            for _, it in ipairs(data.items) do
+                local old
+                for _, o in ipairs(prev.items) do if o.name == it.name then old = o end end
+                local mark = ""
+                if not old then mark = " 🆕"
+                elseif old.stock ~= it.stock then mark = " (was " .. tostring(old.stock) .. ")" end
+                lines[#lines+1] = "• **" .. it.name .. "** — " .. tostring(it.stock) .. " left · "
+                    .. tostring(it.price) .. "g" .. mark
+            end
+            discord("🔄 **" .. data.shop .. " CHANGED**", table.concat(lines, "\n")
+                .. "\n\n⏱ restock: " .. tostring(data.restockText), 16729344)
+        end
     end
 
-    if not Cache.fullSetAnnounced and bannerCount() >= EXPECTED_BANNERS then
-        Cache.fullSetAnnounced = true
-        print("🎉 ALL " .. EXPECTED_BANNERS .. " BANNERS CACHED")
-        discord("🎉 **FULL SET CACHED**", "all " .. EXPECTED_BANNERS .. " banners in the payload", 5763719)
-    end
+    Cache.activeShop = data.shop
     return changed
 end
 
@@ -445,19 +532,23 @@ end
 print("🔌 http=" .. tostring(httpreq ~= nil)
     .. " | getconnections=" .. tostring(getconnections ~= nil)
     .. " | firesignal=" .. tostring(firesignal ~= nil))
-discord("🎴 **AE MONITOR v7 ONLINE**", "session `"..Cache.sessionId.."`", 5763719)
+discord("🪙 **AE GOLD SHOP MONITOR ONLINE**", "session `" .. Cache.sessionId .. "`", 5763719)
 
 pcall(function()
     local VU = game:GetService("VirtualUser")
     LP.Idled:Connect(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end)
 end)
 
-print("👉 open the summon menu (E at the NPC) — tab cycling starts on its own")
-repeat task.wait(1) until panelShowing()
-print("📂 menu detected")
+print("👉 open the Gold Shop — I'll find the GUI myself")
+repeat
+    Cache.gui = findShopGui()
+    task.wait(1)
+until shopShowing()
+print("📂 shop GUI: " .. Cache.gui:GetFullName())
 
 local tabs = findTabs()
 print("🗂 tabs: " .. #tabs)
+for _, t in ipairs(tabs) do print("   • " .. t.name) end
 
 ----------------------------------------------------------------
 -- TAB CYCLE
@@ -465,14 +556,14 @@ print("🗂 tabs: " .. #tabs)
 if TAB_CYCLE then
     task.spawn(function()
         while true do
-            if not panelShowing() then
+            if not shopShowing() then
                 Cache.cycling = false
-                task.wait(2)
+                task.wait(3)
             else
                 tabs = findTabs()
                 local wins = 0
                 for _, tab in ipairs(tabs) do
-                    if not panelShowing() then break end
+                    if not shopShowing() then break end
                     Cache.cycling = true
                     local m = clickTab(tab)
                     if m then
@@ -481,8 +572,8 @@ if TAB_CYCLE then
                             Cache.clickMethod = m
                             print("🖱 tab clicks working via: " .. m)
                         end
-                        task.wait(0.6)
-                        local ok, data = pcall(scanAll)
+                        task.wait(0.7)
+                        local ok, data = pcall(scanShop)
                         if ok and data then record(data) sendToAPI() end
                     else
                         dbg("✗ " .. tab.name .. " didn't respond")
@@ -490,12 +581,11 @@ if TAB_CYCLE then
                     Cache.cycling = false
                     task.wait(TAB_DWELL)
                 end
-
                 if #tabs > 0 and wins == 0 and not Cache.manualMode then
                     Cache.failedCycles = Cache.failedCycles + 1
                     if Cache.failedCycles >= 2 then
                         Cache.manualMode = true
-                        print("🖐 auto-switch blocked — click the tabs yourself, I'll cache each one")
+                        print("🖐 auto-switch blocked — click the shop tabs yourself, I'll cache each")
                     end
                 else
                     Cache.failedCycles = 0
@@ -510,33 +600,33 @@ end
 ----------------------------------------------------------------
 task.spawn(function()
     while true do
-        local open = panelShowing()
+        local open = shopShowing()
         if open then
-            if not Cache.wasOpen then print("📂 summon menu open") Cache.wasOpen = true end
+            if not Cache.wasOpen then print("📂 shop open") Cache.wasOpen = true end
             if not Cache.cycling then
-                local ok, data = pcall(scanAll)
+                local ok, data = pcall(scanShop)
                 if ok and data then
                     if record(data) then sendToAPI() end
-                    print("🎴 "..data.banner.." | "..data.unitCount.." units | "..tostring(data.timerText)
-                        .." | "..tostring(data.currency).." | "..tostring(data.cost.single)
-                        .."/"..tostring(data.cost.ten).." | cached "..bannerCount().."/"..EXPECTED_BANNERS)
+                    print("🪙 " .. data.shop .. " | " .. data.itemCount .. " items | total stock "
+                        .. data.totalStock .. " | restock " .. tostring(data.restockText)
+                        .. " | cached " .. shopCount() .. "/" .. EXPECTED_SHOPS)
                 end
             end
         elseif Cache.wasOpen then
             Cache.wasOpen = false
-            print("📁 menu closed — serving " .. bannerCount() .. " cached banners")
+            print("📁 shop closed — serving " .. shopCount() .. " cached shops")
         end
 
         local now = os.time()
         if (now - Cache.lastPost) >= POST_INTERVAL then sendToAPI() end
         if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then heartbeat() Cache.lastHeartbeat = now end
         if (now - Cache.lastStatus) >= STATUS_INTERVAL then
-            discord("📊 **AE STATUS**", "updates: "..Cache.updateCounter.."\nbanners: "..bannerCount()
-                .."/"..EXPECTED_BANNERS.."\nactive: "..Cache.activeBanner)
+            discord("📊 **GOLD SHOP STATUS**", "updates: " .. Cache.updateCounter
+                .. "\nshops: " .. shopCount() .. "\nactive: " .. Cache.activeShop)
             Cache.lastStatus = now
         end
         task.wait(CHECK_INTERVAL)
     end
 end)
 
-print("🚀 v7 RUNNING | session " .. Cache.sessionId)
+print("🚀 GOLD SHOP MONITOR RUNNING | session " .. Cache.sessionId)
