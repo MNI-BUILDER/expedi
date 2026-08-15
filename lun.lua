@@ -1,8 +1,10 @@
--- ANIME EXPEDITIONS SUMMON MONITOR v6 (FINAL) — manual UI, teleport only, no clicking
-print("🎴 AE Summon Monitor v6 booting...")
+-- ANIME EXPEDITIONS SUMMON MONITOR v7 (FINAL) — manual open, auto tab cycling, no teleport
+print("🎴 AE Summon Monitor v7 booting...")
 
 local HttpService = game:GetService("HttpService")
 local Players     = game:GetService("Players")
+local GuiService  = game:GetService("GuiService")
+local VIM         = game:GetService("VirtualInputManager")
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
@@ -13,16 +15,17 @@ local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/animeexpeditions"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local TELEPORT_TO_NPC   = true    -- walk to the summon NPC at boot + after respawn
-local TELEPORT_ON_SPAWN = true
-local PROMPT_WORDS      = {"summon", "open menu"}
-local EXPECTED_BANNERS  = 4
+local TAB_CYCLE      = true    -- auto-switch banner tabs
+local TAB_DWELL      = 5       -- seconds parked on each tab
+local VERIFY_WINDOW  = 2.2     -- how long to wait for a tab click to register
+local EXPECTED_BANNERS = 4
 
 local CHECK_INTERVAL     = 1
 local POST_INTERVAL      = 5
 local HEARTBEAT_INTERVAL = 30
 local STATUS_INTERVAL    = 900
-local STALE_AFTER        = 900    -- flag a cached banner older than this
+local STALE_AFTER        = 900
+local DEBUG = true
 
 local httpreq = request or http_request or (syn and syn.request) or (fluxus and fluxus.request) or (http and http.request)
 
@@ -30,8 +33,11 @@ local Cache = {
     sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
     updateCounter = 0, lastPost = 0, lastHeartbeat = 0, lastStatus = 0,
     activeBanner = "Unknown", banners = {}, order = {},
-    fullSetAnnounced = false, wasOpen = false
+    cycling = false, clickMethod = nil, failedCycles = 0,
+    manualMode = false, fullSetAnnounced = false, wasOpen = false
 }
+
+local function dbg(s) if DEBUG then print("   " .. s) end end
 
 ----------------------------------------------------------------
 -- BASICS
@@ -99,59 +105,53 @@ local function panelShowing()
     return false
 end
 
-----------------------------------------------------------------
--- TELEPORT TO NPC (only automation left)
-----------------------------------------------------------------
-local function promptMatches(p)
-    local ot = string.lower(tostring(p.ObjectText or ""))
-    local at = string.lower(tostring(p.ActionText or ""))
-    for _, wd in ipairs(PROMPT_WORDS) do
-        if ot:find(wd, 1, true) or at:find(wd, 1, true) then return true end
+local function waitFor(verify, timeout)
+    local t0 = os.clock()
+    while os.clock() - t0 < (timeout or VERIFY_WINDOW) do
+        local ok, r = pcall(verify)
+        if ok and r then return true end
+        task.wait(0.15)
     end
     return false
 end
 
-local function promptPos(p)
-    local par = p.Parent
-    if not par then return nil end
-    if par:IsA("BasePart") then return par.Position end
-    if par:IsA("Attachment") then return par.WorldPosition end
-    if par:IsA("Model") then
-        local ok, cf = pcall(function() return par:GetPivot() end)
-        if ok then return cf.Position end
-    end
-    return nil
-end
-
-local function findPrompt()
-    local best, bestPos
-    pcall(function()
-        for _, d in ipairs(workspace:GetDescendants()) do
-            if d:IsA("ProximityPrompt") and promptMatches(d) then
-                local pos = promptPos(d)
-                if pos and not best then best, bestPos = d, pos end
-            end
+----------------------------------------------------------------
+-- CLICK ENGINE (tabs only)
+----------------------------------------------------------------
+local function trySignals(btn, verify)
+    local gc = getconnections
+    if gc then
+        for _, sig in ipairs({"Activated","MouseButton1Click","MouseButton1Down"}) do
+            local fired = false
+            pcall(function()
+                for _, c in ipairs(gc(btn[sig])) do
+                    fired = true
+                    pcall(function() if c.Fire then c:Fire() else c.Function() end end)
+                end
+            end)
+            if fired and waitFor(verify) then return "gc:" .. sig end
         end
+    end
+    if firesignal then
+        for _, sig in ipairs({"Activated","MouseButton1Click"}) do
+            local ok = pcall(function() firesignal(btn[sig]) end)
+            if ok and waitFor(verify) then return "fs:" .. sig end
+        end
+    end
+    local ok = pcall(function()
+        local pos, sz = btn.AbsolutePosition, btn.AbsoluteSize
+        local sg = btn
+        while sg and not sg:IsA("ScreenGui") do sg = sg.Parent end
+        local yOff = (sg and sg.IgnoreGuiInset) and 0 or GuiService:GetGuiInset().Y
+        local x, y = pos.X + sz.X/2, pos.Y + sz.Y/2 + yOff
+        VIM:SendMouseMoveEvent(x, y, game)
+        task.wait(0.1)
+        VIM:SendMouseButtonEvent(x, y, 0, true,  game, 1)
+        task.wait(0.1)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
     end)
-    return best, bestPos
-end
-
-local function teleportToNPC()
-    if not TELEPORT_TO_NPC then return false end
-    local ch = LP.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then print("⚠️ no character yet") return false end
-    local prompt, pos = findPrompt()
-    if not prompt or not pos then
-        print("⚠️ summon NPC prompt not found — walk over manually")
-        return false
-    end
-    local ok = pcall(function() hrp.CFrame = CFrame.new(pos + Vector3.new(0, 4, 5)) end)
-    if ok then
-        print("🚶 teleported to summon NPC (" .. tostring(prompt.ObjectText) .. ")")
-        return true
-    end
-    return false
+    if ok and waitFor(verify) then return "virtual" end
+    return nil
 end
 
 ----------------------------------------------------------------
@@ -183,6 +183,11 @@ local function resolvePanel()
     return nil, titleNode
 end
 
+local function currentTitle()
+    local _, node = resolvePanel()
+    return node and getText(node) or nil
+end
+
 local function scanAll()
     local gui = getGui()
     if not gui then return nil end
@@ -210,7 +215,7 @@ local function scanAll()
         end
     end
 
-    -- gui scope: costs, packs, pity
+    -- gui scope: costs, packs, pity (these live outside the panel)
     local pity, costs, packs = {}, {}, {}
     for _, d in ipairs(gui:GetDescendants()) do
         local t = getText(d)
@@ -279,6 +284,42 @@ local function scanAll()
         cost = costs, currency = currency, featuredTags = featured,
         pity = pity, lastSeen = os.time()
     }
+end
+
+----------------------------------------------------------------
+-- TABS
+----------------------------------------------------------------
+local function findTabs()
+    local gui = getGui()
+    if not gui then return {} end
+    local tabs, seen = {}, {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if getText(d) == "Banner" then
+            local btn = nearestButton(d, gui)
+            if btn and not seen[btn] then
+                local name
+                for _, sib in ipairs(d.Parent:GetChildren()) do
+                    local st = getText(sib)
+                    if sib ~= d and st and st ~= "" and st ~= "Banner" then name = st break end
+                end
+                if name then
+                    seen[btn] = true
+                    tabs[#tabs+1] = {btn = btn, name = name .. " Banner", x = btn.AbsolutePosition.X}
+                end
+            end
+        end
+    end
+    table.sort(tabs, function(a,b) return a.x < b.x end)
+    return tabs
+end
+
+local function clickTab(tab)
+    local before = currentTitle()
+    if before == tab.name then return "already" end
+    return trySignals(tab.btn, function()
+        local now = currentTitle()
+        return now ~= nil and now ~= before
+    end)
 end
 
 ----------------------------------------------------------------
@@ -371,14 +412,16 @@ local function record(data)
 
     if not prev then
         Cache.order[#Cache.order+1] = data.banner
+        Cache.banners[data.banner] = data
         print("🆕 CACHED " .. data.banner .. " — " .. data.unitCount .. " units | "
             .. tostring(data.currency) .. " | " .. tostring(data.cost.single) .. "/"
-            .. tostring(data.cost.ten) .. "   [" .. (bannerCount()) .. "/" .. EXPECTED_BANNERS .. "]")
+            .. tostring(data.cost.ten) .. "   [" .. bannerCount() .. "/" .. EXPECTED_BANNERS .. "]")
         local miss = missingList()
         if #miss > 0 then print("   still need: " .. table.concat(miss, ", ")) end
+    else
+        Cache.banners[data.banner] = data
     end
 
-    Cache.banners[data.banner] = data
     Cache.activeBanner = data.banner
 
     if changed and prev then
@@ -390,7 +433,7 @@ local function record(data)
 
     if not Cache.fullSetAnnounced and bannerCount() >= EXPECTED_BANNERS then
         Cache.fullSetAnnounced = true
-        print("🎉 ALL " .. EXPECTED_BANNERS .. " BANNERS CACHED — payload is complete")
+        print("🎉 ALL " .. EXPECTED_BANNERS .. " BANNERS CACHED")
         discord("🎉 **FULL SET CACHED**", "all " .. EXPECTED_BANNERS .. " banners in the payload", 5763719)
     end
     return changed
@@ -399,24 +442,68 @@ end
 ----------------------------------------------------------------
 -- BOOT
 ----------------------------------------------------------------
-print("🔌 http=" .. tostring(httpreq ~= nil))
-discord("🎴 **AE MONITOR v6 ONLINE**", "session `"..Cache.sessionId.."`", 5763719)
+print("🔌 http=" .. tostring(httpreq ~= nil)
+    .. " | getconnections=" .. tostring(getconnections ~= nil)
+    .. " | firesignal=" .. tostring(firesignal ~= nil))
+discord("🎴 **AE MONITOR v7 ONLINE**", "session `"..Cache.sessionId.."`", 5763719)
 
 pcall(function()
     local VU = game:GetService("VirtualUser")
     LP.Idled:Connect(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end)
 end)
 
-if TELEPORT_ON_SPAWN then
-    LP.CharacterAdded:Connect(function()
-        task.wait(6)
-        print("♻️ respawned")
-        teleportToNPC()
+print("👉 open the summon menu (E at the NPC) — tab cycling starts on its own")
+repeat task.wait(1) until panelShowing()
+print("📂 menu detected")
+
+local tabs = findTabs()
+print("🗂 tabs: " .. #tabs)
+
+----------------------------------------------------------------
+-- TAB CYCLE
+----------------------------------------------------------------
+if TAB_CYCLE then
+    task.spawn(function()
+        while true do
+            if not panelShowing() then
+                Cache.cycling = false
+                task.wait(2)
+            else
+                tabs = findTabs()
+                local wins = 0
+                for _, tab in ipairs(tabs) do
+                    if not panelShowing() then break end
+                    Cache.cycling = true
+                    local m = clickTab(tab)
+                    if m then
+                        wins = wins + 1
+                        if not Cache.clickMethod and m ~= "already" then
+                            Cache.clickMethod = m
+                            print("🖱 tab clicks working via: " .. m)
+                        end
+                        task.wait(0.6)
+                        local ok, data = pcall(scanAll)
+                        if ok and data then record(data) sendToAPI() end
+                    else
+                        dbg("✗ " .. tab.name .. " didn't respond")
+                    end
+                    Cache.cycling = false
+                    task.wait(TAB_DWELL)
+                end
+
+                if #tabs > 0 and wins == 0 and not Cache.manualMode then
+                    Cache.failedCycles = Cache.failedCycles + 1
+                    if Cache.failedCycles >= 2 then
+                        Cache.manualMode = true
+                        print("🖐 auto-switch blocked — click the tabs yourself, I'll cache each one")
+                    end
+                else
+                    Cache.failedCycles = 0
+                end
+            end
+        end
     end)
 end
-
-teleportToNPC()
-print("👉 press E at the NPC, then click each banner tab once — every one you open gets cached")
 
 ----------------------------------------------------------------
 -- MAIN
@@ -426,12 +513,14 @@ task.spawn(function()
         local open = panelShowing()
         if open then
             if not Cache.wasOpen then print("📂 summon menu open") Cache.wasOpen = true end
-            local ok, data = pcall(scanAll)
-            if ok and data then
-                if record(data) then sendToAPI() end
-                print("🎴 "..data.banner.." | "..data.unitCount.." units | "..tostring(data.timerText)
-                    .." | "..tostring(data.currency).." | "..tostring(data.cost.single)
-                    .."/"..tostring(data.cost.ten).." | cached "..bannerCount().."/"..EXPECTED_BANNERS)
+            if not Cache.cycling then
+                local ok, data = pcall(scanAll)
+                if ok and data then
+                    if record(data) then sendToAPI() end
+                    print("🎴 "..data.banner.." | "..data.unitCount.." units | "..tostring(data.timerText)
+                        .." | "..tostring(data.currency).." | "..tostring(data.cost.single)
+                        .."/"..tostring(data.cost.ten).." | cached "..bannerCount().."/"..EXPECTED_BANNERS)
+                end
             end
         elseif Cache.wasOpen then
             Cache.wasOpen = false
@@ -450,4 +539,4 @@ task.spawn(function()
     end
 end)
 
-print("🚀 v6 RUNNING | session " .. Cache.sessionId)
+print("🚀 v7 RUNNING | session " .. Cache.sessionId)
