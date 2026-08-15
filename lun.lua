@@ -1,268 +1,419 @@
--- ANIME EXPEDITIONS RECON v2.1 — patched (loud errors + real webhook status)
--- OPEN THE SUMMON MENU FIRST, then run.
+-- ANIME EXPEDITIONS SUMMON MONITOR v1 — text-anchored single-pass
+print("🎴 AE Summon Monitor booting...")
 
-local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
-local SEND_DISCORD = true
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/animeexpeditions"
+local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
-local LIVE_ECHO = 30
+-- ^ if the boot test prints 401 or 404, this webhook is DEAD. make a new one.
+
+local CHECK_INTERVAL   = 1
+local POST_INTERVAL    = 5      -- forced post every N s (changes post instantly)
+local HEARTBEAT_INTERVAL = 30
+local STATUS_INTERVAL  = 900    -- discord "still alive" ping
+local AUTO_CYCLE       = false  -- true = auto-click banner tabs to read all 4
+local CYCLE_INTERVAL   = 20
+local FORCE_UI         = false  -- true = force the Summon ScreenGui to stay enabled
 
 local httpreq = request or http_request or (syn and syn.request) or (fluxus and fluxus.request) or (http and http.request)
 
-local ANCHORS = {
-    "banner change","villain banner","standard banner","mini banner","beginner",
-    "limited","mythic unit","legendary unit","secret unit","epic unit",
-    "legendary pity","mythic pity","secret pity",
-    "summon 10x","luck potion","shiny hunter","rates","settings"
+----------------------------------------------------------------
+-- CACHE
+----------------------------------------------------------------
+local Cache = {
+    sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000,9999)),
+    updateCounter = 0,
+    lastPost = 0,
+    lastHeartbeat = 0,
+    lastStatus = 0,
+    lastCycle = 0,
+    activeBanner = "Unknown",
+    banners = {},
+    tabs = nil,
+    tabIndex = 1
 }
-local TIME_PATTERNS = {"%d+m,%s*%d+s","%d+h,%s*%d+m","%d+:%d+:%d+","%d+:%d+"}
-local SKIP_CLASS = {
-    UIListLayout=true,UIGridLayout=true,UIPadding=true,UICorner=true,UIStroke=true,
-    UIGradient=true,UIAspectRatioConstraint=true,UITextSizeConstraint=true,
-    UIScale=true,UISizeConstraint=true,UIPageLayout=true
-}
 
-local buf = {}
-local function w(s) buf[#buf+1] = tostring(s) end
-local function p(s) w(s) print(s) end
-
-local function section(name, fn)
-    local ok, err = pcall(fn)
-    if not ok then p("  ❌ SECTION "..name.." CRASHED: "..tostring(err)) end
-end
-
-local function prop(o, name, default)
-    local ok, v = pcall(function() return o[name] end)
-    if ok and v ~= nil then return v end
-    return default
-end
-
-local function fullpath(o)
-    local t, cur = {}, o
-    while cur and cur ~= game do table.insert(t,1,cur.Name) cur = cur.Parent end
-    return table.concat(t,".")
-end
-
-local function relpath(o, root)             -- ← no pattern magic, this was the crash
-    local full, rp = fullpath(o), fullpath(root)
-    if full:sub(1,#rp) == rp then return full:sub(#rp+2) end
-    return full
-end
-
-local function col3(c)
-    if typeof(c) ~= "Color3" then return "n/a" end
-    return string.format("(%d,%d,%d)", c.R*255, c.G*255, c.B*255)
-end
-
+----------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------
 local function getText(o)
     local ok, t = pcall(function() return o.Text end)
-    if ok and type(t)=="string" then return t end
+    if ok and type(t) == "string" then return t end
     return nil
 end
 
-local function isAnchor(txt)
-    local l = string.lower(txt)
-    for _,a in ipairs(ANCHORS) do if string.find(l,a,1,true) then return a end end
-    for _,pat in ipairs(TIME_PATTERNS) do if string.match(txt,pat) then return "TIMER" end end
+local function onScreen(o)
+    local cur = o
+    while cur and cur ~= game do
+        if cur:IsA("ScreenGui") then return cur.Enabled end
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function inButton(o)
+    local cur = o.Parent
+    while cur and cur ~= game do
+        if cur:IsA("GuiButton") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function num(s)
+    if not s then return nil end
+    return tonumber((s:gsub("[,%s]", "")))
+end
+
+local function parseTime(t)
+    if not t then return nil end
+    local h = tonumber(t:match("(%d+)%s*h")) or 0
+    local m = tonumber(t:match("(%d+)%s*m")) or 0
+    local s = tonumber(t:match("(%d+)%s*s")) or 0
+    if (h + m + s) > 0 then return h*3600 + m*60 + s end
+    local a,b,c = t:match("(%d+):(%d+):(%d+)")
+    if a then return tonumber(a)*3600 + tonumber(b)*60 + tonumber(c) end
+    local d,e = t:match("^(%d+):(%d+)$")
+    if d then return tonumber(d)*60 + tonumber(e) end
     return nil
 end
 
-local function chain(o)
-    local t, cur = {}, o
-    while cur and cur ~= game do table.insert(t,1,cur) cur = cur.Parent end
-    return t
+local function isTimeText(t)
+    return t:match("%d+%s*m,%s*%d+%s*s") or t:match("%d+%s*h,%s*%d+%s*m")
+        or t:match("^%d+%s*s$") or t:match("%d+:%d+")
 end
 
-local function commonAncestor(objs)
-    if #objs == 0 then return nil end
-    local base = chain(objs[1])
-    for i=2,#objs do
-        local a, n = chain(objs[i]), 0
-        for j=1,math.min(#base,#a) do if base[j]==a[j] then n=j else break end end
-        local nb = {}
-        for j=1,n do nb[j]=base[j] end
-        base = nb
+local function getGui()
+    local g = PG:FindFirstChild("Summon")
+    if g and FORCE_UI and g:IsA("ScreenGui") and not g.Enabled then
+        pcall(function() g.Enabled = true end)
     end
-    return base[#base]
+    return g
 end
 
-local function tree(root, depth, pad, maxd)
-    if depth > maxd then return end
-    local kids = root:GetChildren()
-    for i,c in ipairs(kids) do
-        if i > 60 then w(pad.."... +"..(#kids-60).." more") break end
-        if not SKIP_CLASS[c.ClassName] then
-            local s = pad..c.Name.." ["..c.ClassName.."]"
-            if c:IsA("GuiObject") then s = s.." vis="..tostring(prop(c,"Visible","?")) end
-            local t = getText(c)
-            if t and t ~= "" then s = s..' txt="'..t..'"' end
-            if c:IsA("ViewportFrame") then s = s.." <VIEWPORT>" end
-            w(s)
-            tree(c, depth+1, pad.."   ", maxd)
-        end
-    end
-end
+----------------------------------------------------------------
+-- SINGLE-PASS SCAN
+----------------------------------------------------------------
+local function scanUI()
+    local gui = getGui()
+    if not gui then return nil, "no Summon ScreenGui" end
+    if gui:IsA("ScreenGui") and not gui.Enabled then return nil, "summon ui closed" end
 
-p("========== AE SUMMON RECON v2.1 | "..os.date("%X").." ==========")
-p("http fn: "..tostring(httpreq ~= nil))
+    local B = {
+        title = nil, subtitle = nil,
+        bannerChangeNode = nil, timers = {},
+        rarities = {}, pity = {}, costs = {}, packs = {}, featured = 0
+    }
 
-local hits, timerNodes, root = {}, {}, nil
-
-section("1 ANCHORS", function()
-    p("\n##### [1] ANCHOR HITS #####")
-    for _,d in ipairs(PG:GetDescendants()) do
+    for _, d in ipairs(gui:GetDescendants()) do
         local t = getText(d)
-        if t and t ~= "" then
-            local a = isAnchor(t)
-            if a then
-                table.insert(hits, d)
-                if a == "TIMER" then table.insert(timerNodes, d) end
-                p("  ["..a.."] "..fullpath(d))
-                p('        txt="'..t..'"  vis='..tostring(prop(d,"Visible","?")))
-            end
-        end
-    end
-    p("  total: "..#hits)
-    if #hits == 0 then p("  ⚠️ menu probably wasn't open when you ran this") end
-end)
+        if t and t ~= "" and onScreen(d) then
 
-section("2 ROOT", function()
-    p("\n##### [2] SUMMON ROOT #####")
-    root = commonAncestor(hits)
-    if not root then p("  none") return end
-    p("  ROOT -> "..fullpath(root).." ["..root.ClassName.."]")
-    local sg = root
-    while sg and not sg:IsA("ScreenGui") do sg = sg.Parent end
-    if sg then p("  SCREENGUI -> "..sg.Name.." enabled="..tostring(prop(sg,"Enabled","?"))) end
-end)
-
-section("3 TEXT", function()
-    p("\n##### [3] ALL TEXT UNDER ROOT #####")
-    if not root then return end
-    local n = 0
-    for _,d in ipairs(root:GetDescendants()) do
-        local t = getText(d)
-        if t and t ~= "" then
-            n = n + 1
-            local line = '  '..relpath(d, root)..' = "'..t..'"'
-            if n <= 40 then p(line) else w(line) end
-        end
-    end
-    p("  total text nodes: "..n)
-end)
-
-section("4 TABS", function()
-    p("\n##### [4] BANNER TABS #####")
-    local tabHits = {}
-    for _,d in ipairs(hits) do
-        local t = string.lower(getText(d) or "")
-        if t:find("beginner",1,true) or t:find("villain",1,true)
-        or t:find("standard",1,true) or t:find("mini",1,true) then
-            table.insert(tabHits, d)
-        end
-    end
-    local tabParent = commonAncestor(tabHits)
-    if not tabParent then p("  not resolved") return end
-    p("  TAB CONTAINER -> "..fullpath(tabParent))
-    for _,tab in ipairs(tabParent:GetChildren()) do
-        if not SKIP_CLASS[tab.ClassName] then
-            p(string.format("   • %s [%s] bg=%s z=%s vis=%s",
-                tab.Name, tab.ClassName,
-                col3(prop(tab,"BackgroundColor3")),
-                tostring(prop(tab,"ZIndex","?")),
-                tostring(prop(tab,"Visible","?"))))
-            for _,sub in ipairs(tab:GetDescendants()) do
-                local ln = string.lower(sub.Name)
-                if sub:IsA("UIStroke") then
-                    p("        UIStroke enabled="..tostring(prop(sub,"Enabled","?"))
-                      .." thick="..tostring(prop(sub,"Thickness","?"))
-                      .." col="..col3(prop(sub,"Color")))
-                elseif ln:find("select") or ln:find("outline") or ln:find("highlight") or ln:find("glow") or ln:find("active") then
-                    p("        ⭐ "..sub.Name.." ["..sub.ClassName.."] vis="..tostring(prop(sub,"Visible","?")))
+            -- main banner title: full "X Banner" (tabs split it across two labels)
+            local bn = t:match("^(.+)%s+Banner$")
+            if bn and t ~= "Banner" and not inButton(d) and not B.title then
+                B.title = t
+                for _, sib in ipairs(d.Parent:GetChildren()) do
+                    local st = getText(sib)
+                    if sib ~= d and st and st ~= "" and not st:match("Banner$") then
+                        B.subtitle = st
+                        break
+                    end
                 end
             end
-        end
-    end
-end)
 
-section("5 UNITS", function()
-    p("\n##### [5] UNIT SLOTS #####")
-    if not root then return end
-    local n = 0
-    for _,d in ipairs(root:GetDescendants()) do
-        if d:IsA("ViewportFrame") then
-            n = n + 1
-            p("  VIEWPORT "..relpath(d, root))
-            for _,m in ipairs(d:GetChildren()) do p("      model: "..m.Name.." ["..m.ClassName.."]") end
-        end
-    end
-    p("  viewports: "..n)
-end)
+            if t == "Banner Change" then B.bannerChangeNode = d end
+            if isTimeText(t) then table.insert(B.timers, d) end
 
-section("6 TIMERS", function()
-    p("\n##### [6] TIMER CANDIDATES #####")
-    for _,t in ipairs(timerNodes) do p('  '..fullpath(t)..' = "'..tostring(getText(t))..'"') end
-    if #timerNodes == 0 then p("  none — check section 3") end
-end)
+            -- "Mythic Unit" / "Legendary Unit" / "Secret Unit"
+            local rar = t:match("^(%a+)%s+Unit$")
+            if rar then table.insert(B.rarities, {node = d, rarity = rar}) end
 
-section("7 TREE", function()
-    w("\n##### [7] FULL TREE #####")
-    if root then tree(root, 1, "   ", 8) end
-end)
+            if t == "[Featured]" then B.featured = B.featured + 1 end
 
-pcall(function()
-    if writefile then writefile("AE_SUMMON.txt", table.concat(buf,"\n")) print("💾 saved AE_SUMMON.txt") end
-end)
-
--- DISCORD (loud)
-if SEND_DISCORD then
-    task.spawn(function()
-        if not httpreq then print("❌ DISCORD SKIPPED — no http function") return end
-        local head = {}
-        for i=1,math.min(#buf,400) do head[i]=buf[i] end
-        local chunks, cur = {}, ""
-        for line in string.gmatch(table.concat(head,"\n"), "[^\n]+") do
-            if #cur + #line + 1 > 3500 then chunks[#chunks+1]=cur cur="" end
-            cur = cur..line.."\n"
-        end
-        if cur ~= "" then chunks[#chunks+1]=cur end
-        print("📦 chunks to send: "..#chunks)
-
-        for i,c in ipairs(chunks) do
-            if i > 6 then break end
-            local ok, res = pcall(httpreq, {
-                Url = DISCORD_WEBHOOK, Method = "POST",
-                Headers = {["Content-Type"]="application/json", ["User-Agent"]="Mozilla/5.0"},
-                Body = HttpService:JSONEncode({
-                    content = "🔎 **AE RECON** part "..i,
-                    embeds = {{description = "```\n"..c.."```", color = 16729344}}
-                })
-            })
-            if ok then
-                print("  part "..i.." -> status "..tostring(res.StatusCode).." "..tostring(res.StatusMessage))
-                if res.StatusCode ~= 200 and res.StatusCode ~= 204 then
-                    print("     body: "..tostring(res.Body):sub(1,300))
+            -- pity rows
+            local pn = t:match("^(%a+)%s+Pity$")
+            if pn then
+                for _, sib in ipairs(d.Parent:GetChildren()) do
+                    local st = getText(sib)
+                    if sib ~= d and st and st:match("^[%d,]+/[%d,]+$") then
+                        B.pity[pn] = st
+                        break
+                    end
                 end
-            else
-                print("  part "..i.." -> CALL FAILED: "..tostring(res))
             end
-            task.wait(2)
+
+            -- summon costs
+            if t == "Summon" or t == "Summon 10x" then
+                local btn, cur = nil, d
+                while cur and cur ~= gui do
+                    if cur:IsA("GuiButton") then btn = cur break end
+                    cur = cur.Parent
+                end
+                if btn then
+                    for _, sub in ipairs(btn:GetDescendants()) do
+                        local stt = getText(sub)
+                        if stt and stt:match("^[%d,]+$") then
+                            B.costs[t == "Summon" and "single" or "ten"] = num(stt)
+                            break
+                        end
+                    end
+                end
+            end
+
+            -- currency packs: "1,000 Gems" / "2,500 Villain Coins"
+            local amt, curname = t:match("^([%d,]+)%s+(%a[%w%s']*)$")
+            if amt and curname and #curname <= 24 then
+                table.insert(B.packs, {amount = num(amt), currency = curname})
+            end
         end
-    end)
+    end
+
+    if not B.title then return nil, "banner title not visible" end
+
+    -- countdown: prefer a timer sibling of "Banner Change"
+    local timerText
+    if B.bannerChangeNode then
+        for _, sib in ipairs(B.bannerChangeNode.Parent:GetChildren()) do
+            local st = getText(sib)
+            if sib ~= B.bannerChangeNode and st and isTimeText(st) then timerText = st break end
+        end
+    end
+    if not timerText and B.timers[1] then timerText = getText(B.timers[1]) end
+
+    -- units: name is the sibling of the rarity label
+    local units, seen = {}, {}
+    for _, r in ipairs(B.rarities) do
+        for _, sib in ipairs(r.node.Parent:GetChildren()) do
+            local st = getText(sib)
+            if sib ~= r.node and st and st ~= "" and not st:match("%s+Unit$") and not st:match("^%[") then
+                if not seen[st] then
+                    seen[st] = true
+                    table.insert(units, {name = st, rarity = r.rarity})
+                end
+                break
+            end
+        end
+    end
+
+    -- dominant currency across the shop packs
+    local counts, currency, best = {}, nil, 0
+    for _, p in ipairs(B.packs) do
+        counts[p.currency] = (counts[p.currency] or 0) + 1
+        if counts[p.currency] > best then best = counts[p.currency] currency = p.currency end
+    end
+
+    return {
+        banner = B.title,
+        subtitle = B.subtitle,
+        units = units,
+        timerText = timerText,
+        timerSeconds = parseTime(timerText),
+        cost = B.costs,
+        currency = currency,
+        featuredTags = B.featured,
+        pity = B.pity,
+        lastSeen = os.time()
+    }
 end
 
-if LIVE_ECHO > 0 and #timerNodes > 0 then
-    task.spawn(function()
-        print("\n##### [9] LIVE ECHO #####")
-        local t = 0
-        while t < LIVE_ECHO do
+----------------------------------------------------------------
+-- TABS / AUTO-CYCLE
+----------------------------------------------------------------
+local function findTabs(gui)
+    local tabs = {}
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("GuiButton") then
             local parts = {}
-            for _,n in ipairs(timerNodes) do parts[#parts+1] = n.Name.."="..tostring(getText(n)) end
-            print("  ⏱ "..table.concat(parts," | "))
-            task.wait(2) t = t + 2
+            for _, c in ipairs(d:GetDescendants()) do
+                local t = getText(c)
+                if t and t ~= "" then parts[#parts+1] = t end
+            end
+            if #parts == 2 and (parts[1] == "Banner" or parts[2] == "Banner") then
+                local label = (parts[1] == "Banner") and parts[2] or parts[1]
+                table.insert(tabs, {btn = d, name = label .. " Banner"})
+            end
+        end
+    end
+    return tabs
+end
+
+local function clickTab(btn)
+    local gc = getconnections or (getgenv and getgenv().getconnections)
+    if not gc then return false end
+    local fired = false
+    pcall(function()
+        for _, c in ipairs(gc(btn.MouseButton1Click)) do
+            local ok = pcall(function() c:Fire() end)
+            if not ok then pcall(function() c.Function() end) end
+            fired = true
         end
     end)
+    return fired
 end
+
+----------------------------------------------------------------
+-- NETWORK
+----------------------------------------------------------------
+local function post(url, headers, body)
+    if not httpreq then return false, "no http fn" end
+    local ok, res = pcall(httpreq, {Url = url, Method = "POST", Headers = headers, Body = body})
+    if not ok then return false, tostring(res) end
+    local code = "?"
+    pcall(function() code = tostring(res.StatusCode) end)
+    return true, code
+end
+
+local function discord(title, desc, color)
+    if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" then return end
+    local ok, code = post(DISCORD_WEBHOOK,
+        {["Content-Type"] = "application/json", ["User-Agent"] = "Mozilla/5.0"},
+        HttpService:JSONEncode({
+            content = title,
+            embeds = {{description = desc, color = color or 5814783,
+                       footer = {text = "AE | " .. Cache.sessionId},
+                       timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}}
+        }))
+    if not ok then print("  ⚠️ discord call failed: " .. tostring(code))
+    elseif code ~= "204" and code ~= "200" then print("  ⚠️ discord status " .. code) end
+end
+
+local function sendToAPI(payload)
+    Cache.updateCounter = Cache.updateCounter + 1
+    payload.updateNumber = Cache.updateCounter
+    local ok, code = post(API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. os.time(),
+        {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = API_KEY,
+            ["Cache-Control"] = "no-cache, no-store, must-revalidate",
+            ["X-Session-ID"] = Cache.sessionId,
+            ["X-Update-Number"] = tostring(Cache.updateCounter)
+        },
+        HttpService:JSONEncode(payload))
+    print(ok and ("✅ POST #" .. Cache.updateCounter .. " -> " .. code)
+             or ("❌ POST #" .. Cache.updateCounter .. " failed: " .. tostring(code)))
+    return ok
+end
+
+local function heartbeat()
+    post(API_ENDPOINT .. "/heartbeat",
+        {["Content-Type"] = "application/json", ["Authorization"] = API_KEY, ["X-Session-ID"] = Cache.sessionId},
+        HttpService:JSONEncode({sessionId = Cache.sessionId, status = "ALIVE", game = "animeexpeditions", timestamp = os.time()}))
+end
+
+----------------------------------------------------------------
+-- PAYLOAD + CHANGE DETECTION
+----------------------------------------------------------------
+local function unitString(b)
+    if not b or not b.units then return "" end
+    local t = {}
+    for _, u in ipairs(b.units) do t[#t+1] = u.name .. ":" .. u.rarity end
+    table.sort(t)
+    return table.concat(t, "|")
+end
+
+local function buildPayload()
+    local active = Cache.banners[Cache.activeBanner]
+    return {
+        sessionId = Cache.sessionId,
+        game = "animeexpeditions",
+        timestamp = os.time(),
+        playerName = LP.Name,
+        userId = LP.UserId,
+        activeBanner = Cache.activeBanner,
+        bannerChange = active and {text = active.timerText, seconds = active.timerSeconds} or nil,
+        banners = Cache.banners,
+        player = active and {pity = active.pity} or nil
+    }
+end
+
+----------------------------------------------------------------
+-- SETUP
+----------------------------------------------------------------
+local function antiAFK()
+    local VU = game:GetService("VirtualUser")
+    LP.Idled:Connect(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
+    end)
+end
+
+print("🔌 http fn: " .. tostring(httpreq ~= nil))
+discord("🎴 **AE MONITOR ONLINE**", "session `" .. Cache.sessionId .. "`", 5763719)
+print("📨 webhook boot test sent — check the status line above")
+
+antiAFK()
+
+----------------------------------------------------------------
+-- MAIN LOOP
+----------------------------------------------------------------
+task.spawn(function()
+    while true do
+        local ok, data, err = pcall(scanUI)
+        if ok and data then
+            local prev = Cache.banners[data.banner]
+            local changedBanner = (Cache.activeBanner ~= data.banner)
+            local changedUnits  = (unitString(prev) ~= unitString(data))
+
+            Cache.banners[data.banner] = data
+            Cache.activeBanner = data.banner
+
+            if not Cache.tabs then
+                local g = getGui()
+                if g then
+                    Cache.tabs = findTabs(g)
+                    print("🗂 tabs found: " .. #Cache.tabs)
+                end
+            end
+
+            local now = os.time()
+            if changedBanner or changedUnits or (now - Cache.lastPost) >= POST_INTERVAL then
+                sendToAPI(buildPayload())
+                Cache.lastPost = now
+            end
+
+            if changedUnits and prev then
+                local lines = {}
+                for _, u in ipairs(data.units) do lines[#lines+1] = "• **" .. u.name .. "** — " .. u.rarity .. " Unit" end
+                discord("🔄 **BANNER ROTATED**",
+                    "**" .. data.banner .. "**\n" .. (data.subtitle or "") .. "\n\n"
+                    .. table.concat(lines, "\n") .. "\n\n⏱ next change: " .. tostring(data.timerText), 16729344)
+            end
+
+            if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then
+                heartbeat() Cache.lastHeartbeat = now
+            end
+            if (now - Cache.lastStatus) >= STATUS_INTERVAL then
+                local n = 0
+                for _ in pairs(Cache.banners) do n = n + 1 end
+                discord("📊 **AE STATUS**", "updates: " .. Cache.updateCounter
+                    .. "\nbanners cached: " .. n .. "\nactive: " .. Cache.activeBanner, 5814783)
+                Cache.lastStatus = now
+            end
+
+            if AUTO_CYCLE and Cache.tabs and #Cache.tabs > 0 and (now - Cache.lastCycle) >= CYCLE_INTERVAL then
+                Cache.tabIndex = (Cache.tabIndex % #Cache.tabs) + 1
+                local tab = Cache.tabs[Cache.tabIndex]
+                if clickTab(tab.btn) then print("↔️ switched to " .. tab.name)
+                else print("⚠️ getconnections unavailable — auto-cycle off") AUTO_CYCLE = false end
+                Cache.lastCycle = now
+            end
+
+            print("🎴 " .. data.banner .. " | " .. #data.units .. " units | "
+                .. tostring(data.timerText) .. " | " .. tostring(data.currency))
+        else
+            print("⏸ " .. tostring(data or err or "scan failed"))
+        end
+        task.wait(CHECK_INTERVAL)
+    end
+end)
+
+print("🚀 MONITORING STARTED | session " .. Cache.sessionId)
